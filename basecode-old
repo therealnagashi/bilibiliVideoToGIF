@@ -1,7 +1,6 @@
-# Bilibili视频转GIF工具By:丶樱流
+# Bilibili视频转GIF工具By:樱流
 # 支持下载bilibili视频并转换为GIF动图，新增本地视频上传功能
 # 新增功能：自动识别和移除黑边、bilibili水印，支持本地视频文件
-# 25-9-19优化版本：大幅提升GIF转换速度
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import os
@@ -16,9 +15,6 @@ from pathlib import Path
 import re
 from urllib.parse import urlparse
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import tempfile
-import gc
 
 # 显示控制台窗口
 if os.name == 'nt':  # Windows系统
@@ -301,207 +297,6 @@ class VideoProcessor:
         
         return crop_top, crop_bottom, crop_left, crop_right
 
-class OptimizedFrameProcessor:
-    """优化的帧处理器 - 大幅提升转换速度"""
-    
-    def __init__(self, max_workers=None):
-        # 根据CPU核心数自动设置工作线程数，但优化线程配置
-        if max_workers is None:
-            cpu_count = os.cpu_count() or 1
-            # 对于I/O密集型任务，可以使用更多线程
-            max_workers = min(12, cpu_count * 2)  # 提高到CPU核心数的2倍，最多12个线程
-        self.max_workers = max_workers
-        print(f"使用 {max_workers} 个线程进行帧处理")
-    
-    def process_frame_batch_optimized(self, frame_data, target_width, target_height, max_colors, crop_params=None):
-        """优化的批量帧处理 - 减少内存拷贝和提高处理效率"""
-        try:
-            from PIL import Image
-            
-            frame, frame_index = frame_data
-            
-            # 提前应用裁切以减少后续处理的数据量
-            if crop_params and any(crop_params):
-                crop_top, crop_bottom, crop_left, crop_right = crop_params
-                h, w = frame.shape[:2]
-                if crop_top + crop_bottom < h and crop_left + crop_right < w:
-                    frame = frame[crop_top:h-crop_bottom, crop_left:w-crop_right]
-            
-            # 优化的颜色空间转换 - 直接转换为RGB避免多次转换
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            
-            # 创建PIL图像并直接resize
-            img = Image.fromarray(frame_rgb)
-            
-            # 优化resize方法 - 根据缩放比例选择合适的算法
-            current_size = img.size
-            scale_factor = (target_width * target_height) / (current_size[0] * current_size[1])
-            
-            if scale_factor < 0.5:
-                # 大幅缩小时使用LANCZOS获得更好质量
-                resample_method = Image.Resampling.LANCZOS
-            elif scale_factor < 0.8:
-                # 中等缩小时使用BILINEAR平衡速度和质量
-                resample_method = Image.Resampling.BILINEAR
-            else:
-                # 轻微缩放或放大时使用最快的NEAREST
-                resample_method = Image.Resampling.NEAREST
-            
-            img = img.resize((target_width, target_height), resample_method)
-            
-            # 优化的颜色量化 - 根据颜色数量选择最佳策略
-            if max_colors < 256:
-                if max_colors <= 32:
-                    # 极少颜色时使用最快的MAXCOVERAGE方法
-                    img = img.quantize(colors=max_colors, method=Image.Quantize.MAXCOVERAGE)
-                elif max_colors <= 64:
-                    # 较少颜色时使用FASTOCTREE方法
-                    img = img.quantize(colors=max_colors, method=Image.Quantize.FASTOCTREE)
-                else:
-                    # 较多颜色时使用MEDIANCUT方法获得更好质量
-                    img = img.quantize(colors=max_colors, method=Image.Quantize.MEDIANCUT)
-            
-            # 立即清理原始帧数据
-            del frame, frame_rgb
-            
-            return frame_index, img
-            
-        except Exception as e:
-            print(f"处理第{frame_index}帧时出错: {e}")
-            return frame_index, None
-    
-    def extract_and_process_frames_optimized(self, input_file, start_time, end_time, fps, 
-                                          target_width, target_height, max_colors, 
-                                          crop_params=None, progress_callback=None):
-        """优化的帧提取和处理 - 流水线处理提高效率"""
-        if not CV2_AVAILABLE:
-            raise Exception("需要OpenCV支持")
-        
-        frames = []
-        cap = cv2.VideoCapture(input_file)
-        
-        if not cap.isOpened():
-            raise Exception(f"无法打开视频文件: {input_file}")
-        
-        try:
-            # 获取视频信息
-            video_fps = cap.get(cv2.CAP_PROP_FPS)
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            
-            # 计算需要提取的帧
-            duration = end_time - start_time
-            target_frame_count = int(duration * fps)
-            
-            # 设置起始位置
-            start_frame = int(start_time * video_fps)
-            end_frame = min(int(end_time * video_fps), total_frames)
-            
-            # 优化的帧间隔计算
-            available_frames = end_frame - start_frame
-            frame_step = max(1, available_frames // target_frame_count)
-            
-            print(f"视频信息: FPS={video_fps:.2f}, 总帧数={total_frames}")
-            print(f"提取范围: 第{start_frame}帧到第{end_frame}帧，间隔{frame_step}帧")
-            print(f"预计提取 {target_frame_count} 帧")
-            
-            # 使用流水线方式提取和处理帧
-            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-            
-            # 创建帧数据队列用于流水线处理
-            frame_queue = []
-            current_frame_pos = start_frame
-            extracted_count = 0
-            
-            # 第一阶段：快速提取所有需要的原始帧
-            while current_frame_pos < end_frame and extracted_count < target_frame_count:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                
-                # 只保存需要的帧
-                if (current_frame_pos - start_frame) % frame_step == 0:
-                    frame_queue.append((frame.copy(), extracted_count))
-                    extracted_count += 1
-                    
-                    # 更新进度
-                    if progress_callback and extracted_count % 30 == 0:
-                        progress_callback(f"提取帧中... {extracted_count}/{target_frame_count}")
-                
-                current_frame_pos += 1
-                
-                # 跳帧以提高速度
-                if frame_step > 1:
-                    next_pos = current_frame_pos + frame_step - 1
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, next_pos)
-                    current_frame_pos = next_pos
-            
-            cap.release()
-            print(f"实际提取了 {len(frame_queue)} 帧")
-            
-            if not frame_queue:
-                raise Exception("未能提取到任何帧")
-            
-            # 第二阶段：并行处理所有帧
-            if progress_callback:
-                progress_callback("并行处理帧中...")
-            
-            processed_frames = [None] * len(frame_queue)
-            
-            # 使用批处理提高效率
-            batch_size = min(20, len(frame_queue))  # 批处理大小
-            
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                # 提交所有任务
-                future_to_index = {}
-                for i in range(0, len(frame_queue), batch_size):
-                    batch_end = min(i + batch_size, len(frame_queue))
-                    batch_data = frame_queue[i:batch_end]
-                    
-                    for j, frame_data in enumerate(batch_data):
-                        future = executor.submit(
-                            self.process_frame_batch_optimized,
-                            frame_data,
-                            target_width,
-                            target_height,
-                            max_colors,
-                            crop_params
-                        )
-                        future_to_index[future] = i + j
-                
-                # 使用as_completed获得更好的响应性
-                completed = 0
-                for future in as_completed(future_to_index):
-                    try:
-                        frame_index, processed_frame = future.result(timeout=30)
-                        if processed_frame is not None:
-                            processed_frames[frame_index] = processed_frame
-                        completed += 1
-                        
-                        # 更新进度
-                        if progress_callback and completed % 15 == 0:
-                            progress_callback(f"处理帧中... {completed}/{len(frame_queue)}")
-                            
-                    except Exception as e:
-                        print(f"处理帧时出错: {e}")
-                        continue
-            
-            # 过滤掉处理失败的帧
-            frames = [f for f in processed_frames if f is not None]
-            
-            # 立即清理内存
-            del frame_queue, processed_frames
-            gc.collect()
-            
-            if not frames:
-                raise Exception("所有帧处理失败")
-            
-            print(f"成功处理了 {len(frames)} 帧")
-            return frames
-            
-        finally:
-            if cap.isOpened():
-                cap.release()
-
 class BilibiliToGifConverter:
     """bilibili视频转GIF转换器"""
     
@@ -517,9 +312,6 @@ class BilibiliToGifConverter:
         self.is_converting = False
         self.is_local_file = False  # 新增：标记是否为本地文件
         self.local_file_path = None  # 新增：本地文件路径
-        
-        # 初始化优化的帧处理器
-        self.frame_processor = OptimizedFrameProcessor()
         
     def setup_directories(self):
         """设置目录结构"""
@@ -546,7 +338,7 @@ class BilibiliToGifConverter:
     
     def setup_gui(self):
         """设置GUI界面"""
-        self.root.title(" Bilibili视频转GIF工具By:丶樱流 ")
+        self.root.title("Bilibili视频转GIF工具By:樱流")
         self.root.geometry("950x800")
         self.root.minsize(900, 750)
         self.root.resizable(True, True)
@@ -650,7 +442,7 @@ class BilibiliToGifConverter:
         
         # 帧率设置
         ttk.Label(gif_frame, text="帧率(FPS):").grid(row=1, column=0, sticky=tk.W, pady=(5, 0))
-        self.fps_var = tk.StringVar(value="20")  # 进一步提高默认帧率以改善流畅度
+        self.fps_var = tk.StringVar(value="10")
         ttk.Entry(gif_frame, textvariable=self.fps_var, width=8).grid(
             row=1, column=1, sticky=tk.W, padx=(5, 20), pady=(5, 0)
         )
@@ -1235,7 +1027,7 @@ class BilibiliToGifConverter:
             fps = int(self.fps_var.get())
         except (ValueError, AttributeError):
             duration = 10  # 默认值
-            fps = 20  # 提高默认帧率
+            fps = 10
         
         if duration <= 0:
             duration = 10
@@ -1618,7 +1410,7 @@ class BilibiliToGifConverter:
         self.progress_var.set("正在停止...")
     
     def _conversion_thread(self, params):
-        """转换线程 - 使用优化的转换方法"""
+        """转换线程"""
         try:
             if params['is_local_file']:
                 # 处理本地文件
@@ -1714,8 +1506,8 @@ class BilibiliToGifConverter:
             safe_title = re.sub(r'[-\s]+', '-', safe_title)
             output_file = params['output_path'] / f"{safe_title}_{timestamp}.gif"
             
-            # 使用优化的转换方法
-            self._convert_with_super_optimized_method(
+            # 使用PIL方法转换GIF
+            self._convert_with_pil(
                 str(temp_video),
                 str(output_file),
                 params['start_time'],
@@ -1745,118 +1537,252 @@ class BilibiliToGifConverter:
         finally:
             self.root.after(0, self._conversion_finished)
     
-    def _convert_with_super_optimized_method(self, input_file, output_file, start_time, end_time, width, height, fps, quality, remove_black_borders, remove_watermark):
-        """进行转换"""
+    def _convert_with_pil(self, input_file, output_file, start_time, end_time, width, height, fps, quality, remove_black_borders, remove_watermark):
+        """使用PIL进行转换（统一方法，包含智能裁切）"""
         try:
             from PIL import Image
             
-            # 质量设置
-            quality_colors = {"高": 256, "中": 128, "低": 64}.get(quality, 128)
-            
-            # 进度回调函数
-            def progress_callback(msg):
-                if self.is_converting:  # 只有在转换状态才更新进度
-                    self.root.after(0, lambda m=msg: self.progress_var.set(m))
-            
             # 如果需要智能处理且OpenCV可用
-            crop_params = None
             if (remove_black_borders or remove_watermark) and CV2_AVAILABLE:
-                print("使用智能裁切方法")
-                
-                # 快速分析裁切参数 - 只分析1帧以提高速度
-                cap = cv2.VideoCapture(input_file)
-                if not cap.isOpened():
-                    raise Exception(f"无法打开视频文件: {input_file}")
-                
-                # 设置到开始位置并分析1帧
-                cap.set(cv2.CAP_PROP_POS_MSEC, (start_time + (end_time - start_time) / 2) * 1000)  # 分析中间帧
-                ret, frame = cap.read()
-                cap.release()
-                
-                if ret:
-                    crop_top, crop_bottom, crop_left, crop_right = VideoProcessor.calculate_smart_crop(
-                        frame, remove_black_borders, remove_watermark
-                    )
-                    crop_params = (crop_top, crop_bottom, crop_left, crop_right)
-                    print(f"智能裁切参数: top={crop_params[0]}, bottom={crop_params[1]}, left={crop_params[2]}, right={crop_params[3]}")
-                    
-                    # 立即清理
-                    del frame
-                    gc.collect()
-            
-            # 使用优化的帧处理器
-            frames = self.frame_processor.extract_and_process_frames_optimized(
-                input_file, start_time, end_time, fps, 
-                width, height, quality_colors, 
-                crop_params, progress_callback
-            )
-            
-            if not frames or not self.is_converting:
-                raise Exception("帧提取失败或转换被取消")
-            
-            #优化的GIF保存
-            progress_callback("保存GIF文件中...")
-            print(f"开始保存GIF，共 {len(frames)} 帧")
-            
-            # 使用最优化的保存参数
-            frame_duration = max(20, int(1000 / fps))  # 最小20ms避免太快
-            
-            # 根据质量选择最佳保存策略
-            if quality == "高" and len(frames) < 100:
-                # 高质量且帧数不多时，使用最佳质量保存
-                save_kwargs = {
-                    'save_all': True,
-                    'append_images': frames[1:],
-                    'duration': frame_duration,
-                    'loop': 0,
-                    'optimize': True,
-                    'disposal': 2  # 恢复到背景色，减少文件大小
-                }
+                print("使用PIL智能裁切方法")
+                self._convert_with_pil_smart_crop(input_file, output_file, start_time, end_time, width, height, fps, quality, remove_black_borders, remove_watermark)
             else:
-                # 其他情况使用平衡的保存参数
-                save_kwargs = {
-                    'save_all': True,
-                    'append_images': frames[1:],
-                    'duration': frame_duration,
-                    'loop': 0,
-                    'optimize': True,
-                    'disposal': 2
-                }
-            
-            # 保存GIF
-            try:
-                frames[0].save(output_file, **save_kwargs)
-            except Exception as save_error:
-                # 如果保存失败，尝试降低质量保存
-                print(f"保存失败，尝试降低质量: {save_error}")
-                # 重新量化所有帧为更少颜色
-                reduced_frames = []
-                for frame in frames:
-                    if hasattr(frame, 'quantize'):
-                        reduced_frame = frame.quantize(colors=min(64, quality_colors))
-                        reduced_frames.append(reduced_frame)
-                    else:
-                        reduced_frames.append(frame)
-                
-                # 尝试用减少的颜色保存
-                save_kwargs['append_images'] = reduced_frames[1:]
-                reduced_frames[0].save(output_file, **save_kwargs)
-            
-            # 立即清理内存
-            del frames
-            if 'reduced_frames' in locals():
-                del reduced_frames
-            gc.collect()
-            
-            if not Path(output_file).exists() or Path(output_file).stat().st_size == 0:
-                raise Exception("GIF保存失败")
-            
-            file_size = Path(output_file).stat().st_size / (1024 * 1024)
-            print(f"GIF转换完成，文件大小: {file_size:.2f}MB")
+                print("使用PIL标准方法")
+                self._convert_with_pil_standard(input_file, output_file, start_time, end_time, width, height, fps, quality)
                 
         except Exception as e:
-            print(f"优化转换失败: {str(e)}")
+            print(f"PIL转换失败: {str(e)}")
             raise
+    
+    def _convert_with_pil_smart_crop(self, input_file, output_file, start_time, end_time, width, height, fps, quality, remove_black_borders, remove_watermark):
+        """使用PIL进行智能裁切转换"""
+        try:
+            from PIL import Image
+            
+            cap = cv2.VideoCapture(input_file)
+            if not cap.isOpened():
+                raise Exception(f"无法打开视频文件: {input_file}")
+            
+            # 设置开始位置
+            cap.set(cv2.CAP_PROP_POS_MSEC, start_time * 1000)
+            
+            # 分析几帧确定裁切参数
+            analysis_frames = []
+            for i in range(3):
+                ret, frame = cap.read()
+                if ret:
+                    analysis_frames.append(frame)
+                    cap.set(cv2.CAP_PROP_POS_MSEC, (start_time + i * 2) * 1000)
+            
+            if not analysis_frames:
+                raise Exception("无法读取分析帧")
+            
+            # 计算最优裁切参数
+            crop_params_list = []
+            for frame in analysis_frames:
+                crop_top, crop_bottom, crop_left, crop_right = VideoProcessor.calculate_smart_crop(
+                    frame, remove_black_borders, remove_watermark
+                )
+                crop_params_list.append((crop_top, crop_bottom, crop_left, crop_right))
+            
+            # 使用保守的裁切值
+            if crop_params_list:
+                final_crop_top = max(p[0] for p in crop_params_list)
+                final_crop_bottom = max(p[1] for p in crop_params_list)
+                final_crop_left = max(p[2] for p in crop_params_list)
+                final_crop_right = max(p[3] for p in crop_params_list)
+            else:
+                final_crop_top = final_crop_bottom = final_crop_left = final_crop_right = 0
+            
+            # 重新设置到开始位置
+            cap.set(cv2.CAP_PROP_POS_MSEC, start_time * 1000)
+            
+            frames = []
+            frame_interval = 1.0 / fps
+            current_time = start_time
+            frame_count = 0
+            max_frames = int((end_time - start_time) * fps)
+            
+            # 根据质量设置调色板大小
+            quality_settings = {"高": 256, "中": 128, "低": 64}
+            max_colors = quality_settings.get(quality, 128)
+            
+            while current_time < end_time and self.is_converting and frame_count < max_frames:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                # 应用智能裁切
+                if any([final_crop_top, final_crop_bottom, final_crop_left, final_crop_right]):
+                    h, w = frame.shape[:2]
+                    crop_top = min(final_crop_top, h // 4)
+                    crop_bottom = min(final_crop_bottom, h // 4)
+                    crop_left = min(final_crop_left, w // 4)
+                    crop_right = min(final_crop_right, w // 4)
+                    
+                    if crop_top + crop_bottom < h and crop_left + crop_right < w:
+                        frame = frame[crop_top:h-crop_bottom, crop_left:w-crop_right]
+                
+                # 转换并调整大小
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                img = Image.fromarray(frame_rgb)
+                img = img.resize((width, height), Image.Resampling.LANCZOS)
+                
+                if max_colors < 256:
+                    img = img.quantize(colors=max_colors)
+                
+                frames.append(img)
+                frame_count += 1
+                
+                # 跳到下一帧
+                current_time += frame_interval
+                cap.set(cv2.CAP_PROP_POS_MSEC, current_time * 1000)
+                
+                # 更新进度
+                if frame_count % 10 == 0:
+                    self.root.after(0, lambda fc=frame_count: self.progress_var.set(f"处理中... {fc}帧"))
+            
+            cap.release()
+            
+            if frames and self.is_converting:
+                frames[0].save(
+                    output_file,
+                    save_all=True,
+                    append_images=frames[1:],
+                    duration=int(1000 / fps),
+                    loop=0,
+                    optimize=True
+                )
+                
+                if not Path(output_file).exists() or Path(output_file).stat().st_size == 0:
+                    raise Exception("PIL智能裁切保存失败")
+            else:
+                raise Exception("没有提取到有效帧")
+                
+        except Exception as e:
+            print(f"PIL智能裁切失败: {str(e)}")
+            raise
+    
+    def _convert_with_pil_standard(self, input_file, output_file, start_time, end_time, width, height, fps, quality):
+        """使用PIL标准转换（备用方案）"""
+        try:
+            from PIL import Image
+            import tempfile
+            
+            print(f"使用PIL标准转换: {width}x{height}, FPS:{fps}")
+            
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_frames_pattern = os.path.join(temp_dir, "frame_%04d.png")
+                
+                # 尝试使用ffmpeg提取帧
+                extract_cmd = [
+                    'ffmpeg', '-y',
+                    '-i', input_file,
+                    '-ss', str(start_time),
+                    '-t', str(end_time - start_time),
+                    '-vf', f'fps={fps}',
+                    '-frames:v', str(int((end_time - start_time) * fps * 1.2)),  # 限制最大帧数
+                    temp_frames_pattern
+                ]
+                
+                try:
+                    result = subprocess.run(extract_cmd, check=True, capture_output=True, timeout=60)
+                    print("使用ffmpeg提取帧成功")
+                except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+                    # 如果ffmpeg失败，使用OpenCV
+                    if CV2_AVAILABLE:
+                        print("ffmpeg失败，使用OpenCV提取帧")
+                        self._extract_frames_with_opencv(input_file, temp_dir, start_time, end_time, fps)
+                    else:
+                        raise Exception("无法提取视频帧，请确保安装了ffmpeg或opencv-python")
+                
+                # 读取帧
+                frames = []
+                frame_files = sorted([f for f in os.listdir(temp_dir) if f.startswith('frame_') and f.endswith('.png')])
+                
+                if not frame_files:
+                    raise Exception("未能提取到视频帧")
+                
+                # 限制帧数防止内存问题
+                if len(frame_files) > 200:
+                    frame_files = frame_files[:200]
+                    print(f"限制帧数到 {len(frame_files)} 帧以防止内存问题")
+                
+                quality_settings = {"高": 256, "中": 128, "低": 64}
+                max_colors = quality_settings.get(quality, 128)
+                
+                for i, frame_file in enumerate(frame_files):
+                    if not self.is_converting:
+                        return
+                    
+                    frame_path = os.path.join(temp_dir, frame_file)
+                    try:
+                        with Image.open(frame_path) as img:
+                            img = img.resize((width, height), Image.Resampling.LANCZOS)
+                            if max_colors < 256:
+                                img = img.quantize(colors=max_colors)
+                            frames.append(img.copy())
+                    except Exception as e:
+                        print(f"跳过损坏帧: {frame_file}")
+                        continue
+                    
+                    # 更新进度
+                    if i % 10 == 0:
+                        self.root.after(0, lambda fc=i: self.progress_var.set(f"处理帧 {fc}/{len(frame_files)}"))
+                
+                if frames and self.is_converting:
+                    frames[0].save(
+                        output_file,
+                        save_all=True,
+                        append_images=frames[1:],
+                        duration=int(1000 / fps),
+                        loop=0,
+                        optimize=True
+                    )
+                    
+                    if not os.path.exists(output_file) or os.path.getsize(output_file) == 0:
+                        raise Exception("PIL标准转换保存失败")
+                else:
+                    raise Exception("没有提取到有效帧或转换被取消")
+                    
+        except Exception as e:
+            print(f"PIL标准转换失败: {str(e)}")
+            raise
+    
+    def _extract_frames_with_opencv(self, input_file, temp_dir, start_time, end_time, fps):
+        """使用OpenCV提取帧"""
+        if not CV2_AVAILABLE:
+            raise Exception("OpenCV不可用")
+        
+        cap = cv2.VideoCapture(input_file)
+        if not cap.isOpened():
+            raise Exception(f"无法打开视频文件: {input_file}")
+        
+        # 设置开始位置
+        cap.set(cv2.CAP_PROP_POS_MSEC, start_time * 1000)
+        
+        frame_interval = 1.0 / fps
+        current_time = start_time
+        frame_count = 0
+        
+        while current_time < end_time and self.is_converting:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # 保存帧
+            frame_path = os.path.join(temp_dir, f"frame_{frame_count:04d}.png")
+            cv2.imwrite(frame_path, frame)
+            frame_count += 1
+            
+            # 跳到下一帧
+            current_time += frame_interval
+            cap.set(cv2.CAP_PROP_POS_MSEC, current_time * 1000)
+        
+        cap.release()
+        
+        if frame_count == 0:
+            raise Exception("OpenCV未能提取到任何帧")
     
     def _conversion_complete(self, output_file):
         """转换完成"""
@@ -1889,7 +1815,7 @@ class BilibiliToGifConverter:
 
 def main():
     """主函数"""
-    print("启动 Bilibili视频转GIF工具By:丶樱流")
+    print("启动 Bilibili视频转GIF工具By:樱流...")
     
     # 设置环境变量解决Windows编码问题
     if os.name == 'nt':
